@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+#!/usr/bin/expect
+#
+# Upload the zipped artifacts to bintray
+
+set -e
+(
+  # Checks for the existence of the fpm executable
+  check_fpm_existence() {
+    hash fpm 2>/dev/null
+  }
+
+  fpm_installation_instructions() {
+    echo "Could not find fpm, install it according to instructions here:"
+    echo "https://github.com/jordansissel/fpm"
+  }
+
+  # Find the fullpath to the project root
+  project_root_directory() {
+    local source="${BASH_SOURCE[0]}"
+    # resolve all symlinks
+    while [ -h "$source" ] ; do source="$(readlink "$source")"; done
+    dir="$( cd -P "$( dirname "$source" )/.." && pwd )"
+    echo "$dir"
+  }
+
+  # Create a file with checksum for all files for this version
+  # Arguments:
+  #   version: The version to create checksums for
+  create_checksums() {
+    local version=$1
+
+    pushd ./pkg/dist
+    shasum -a256 *.zip > "./dom4tools_${version}_SHA256SUMS"
+    popd
+  }
+
+  # Remove the dist dir and recreate it
+  regenerate_dist_dir() {
+    rm -rf ./pkg/dist
+    mkdir -p ./pkg/dist
+  }
+
+  # Move the artifacts from build dir to dist dir.
+  # Arguments:
+  #   version: The version to create checksums for
+  move_artifacts() {
+    local version=$1
+
+    for filename in $(find ./pkg -mindepth 1 -maxdepth 1 -type f); do
+      filename=$(basename $filename)
+      cp ./pkg/${filename} "./pkg/dist/dom4tools_${version}_${filename}"
+    done
+  }
+
+  # Move the linux artifacts to their own directory for packaging.
+  # Also copies any config files.
+  # Arguments:
+  #   version: The version to create checksums for
+  prepare_packaging_directories() {
+    local version=$1
+
+    for dirname in $(find ./pkg -mindepth 1 -maxdepth 1 -type d -name "linux_*"); do
+      packagedir="./pkg/dist/dom4tools_${version}_$(basename $dirname)"
+      bindir="${packagedir}/bin"
+      autocomplete_bash_dir="${packagedir}/etc/bash_completion.d/"
+      #autocomplete_zsh_dir="${packagedir}/usr/share/zsh/vendor-completions/"
+
+      mkdir -p "${bindir}"
+      mkdir -p "${autocomplete_bash_dir}"
+      #mkdir -p "${autocomplete_zsh_dir}"
+
+      cp ./autocomplete/bash/* "${autocomplete_bash_dir}"
+      #cp ./autocomplete/zsh/* "${autocomplete_zsh_dir}"
+      cp "${dirname}/"* "${bindir}"
+    done
+  }
+
+  # Upload the zipped binaries for direct download
+  # Arguments:
+  #   version: The version to upload
+  #   bintray_api_key: API key for bintray
+  #   bintray_gpg_passphrase: Passphrase for the GPG key used to sign the packages
+  upload_binaries() {
+    local version=$1
+    local bintray_api_key=$2
+    local bintray_gpg_passphrase=$3
+
+    for ARCHIVE in ./pkg/dist/*.zip; do
+      [ -e "$ARCHIVE" ] || continue
+      ARCHIVE_NAME=$(basename ${ARCHIVE})
+
+      echo Uploading: $ARCHIVE_NAME
+      curl \
+        -T ${ARCHIVE} \
+        -upromisedlandt:${bintray_api_key} \
+        --header "X-Bintray-Publish: 1" \
+        --header "X-GPG-PASSPHRASE: ${bintray_gpg_passphrase}" \
+        "https://api.bintray.com/content/promisedlandt/dom4tools/dom4tools/${version}/${ARCHIVE_NAME}"
+    done
+  }
+
+  # Build Debian packages
+  # Arguments:
+  #   version: The version to package
+  build_debian_packages() {
+    local version=$1
+
+    echo "Creating Debian packages"
+    fpm_build_packages $version "deb"
+  }
+
+  # Build RPM packages
+  # Arguments:
+  #   version: The version to package
+  build_rpm_packages() {
+    local version=$1
+
+    echo "Creating RPM packages"
+    fpm_build_packages $version "rpm"
+  }
+
+  # Build package with FPM
+  # Arguments:
+  #   version: The version to upload
+  #   package_type: [deb|rpm] build Debian or RPM package?
+  fpm_build_packages() {
+    local version=$1
+    local package_type=$2
+
+    for dirname in $(find ./pkg/dist -mindepth 1 -maxdepth 1 -type d -name "dom4tools_${version}_linux_*"); do
+      local stem=$(basename $dirname)
+      local arch=${stem#dom4tools_${version}_linux_}
+
+      arch=$(go_arch_to_dist_arch $arch)
+
+      fpm -s dir -t ${package_type} --force --name dom4tools --architecture ${arch} --package "${dirname}.${package_type}" --version ${version} --license MIT --maintainer "Nils Landt <nils.landt@nlsoft.de>" --description "Manage your Dominions 4 games from the command line" --deb-no-default-config-files --url "https://github.com/promisedlandt/dom4tools" "${dirname}/etc/"=/etc/ "${dirname}/bin/"=/usr/local/bin/ "${dirname}"
+      #fpm -s dir -t ${package_type} --force --name dom4tools --architecture ${arch} --package "${dirname}.${package_type}" --version ${version} --license MIT --maintainer "Nils Landt <nils.landt@nlsoft.de>" --description "Manage your Dominions 4 games from the command line" --deb-no-default-config-files --url "https://github.com/promisedlandt/dom4tools" "${dirname}/etc/"=/etc/ "${dirname}/bin/"=/usr/local/bin/ "${dirname}/usr/share/zsh/vendor-completions/"=/usr/share/zsh/vendor-completions "${dirname}"
+      #fpm -s zip -t ${package_type} --force --rpm-sign --prefix /usr/local/bin --name dom4tools --architecture ${arch} --package ./pkg/dist/dom4tools_${version}_${stem}.${package_type} --version ${version} --license MIT --maintainer "Nils Landt <nils.landt@nlsoft.de>" --description "Manage your Dominions 4 games from the command line" --url "https://github.com/promisedlandt/dom4tools" pkg/dist/dom4tools_${version}_${stem}.zip
+    done
+  }
+
+  # Translate the Go architecture name to one understood by dpkg / rpm
+  # Arguments:
+  #   arch: architecture name to translate
+  go_arch_to_dist_arch() {
+    local arch=$1
+
+    if [[ $arch = "386" ]]; then
+      arch="i${arch}"
+    fi
+
+    echo $arch
+  }
+
+  # Upload the previously built Debian packages to the bintray repository
+  # Arguments:
+  #   version: The version to upload
+  #   bintray_api_key: API key for bintray
+  #   bintray_gpg_passphrase: Passphrase for the GPG key used to sign the packages
+  upload_debian_packages() {
+    local version=$1
+    local bintray_api_key=$2
+    local bintray_gpg_passphrase=$3
+
+    for package in ./pkg/dist/*.deb; do
+      [ -e "$package" ] || continue
+      local package_name=$(basename "$package")
+      local arch=${package_name#dom4tools_${version}_linux_}
+      arch=${arch%.deb}
+
+      echo "Uploading: ${package_name}"
+      curl \
+        -T ${package} \
+        -upromisedlandt:${bintray_api_key} \
+        --header "X-GPG-PASSPHRASE: ${bintray_gpg_passphrase}" \
+        --header "X-Bintray-Debian-Distribution: squeeze,wheezy,jessie,precise,trusty,vivid" \
+        --header "X-Bintray-Debian-Component: main" \
+        --header "X-Bintray-Debian-Architecture: $arch" \
+        "https://api.bintray.com/content/promisedlandt/dom4tools_deb/dom4tools/${version}/${package_name};publish=1"
+    done
+  }
+
+  # Upload the previously built RPM packages to the bintray repository
+  # Arguments:
+  #   version: The version to upload
+  #   bintray_api_key: API key for bintray
+  #   bintray_gpg_passphrase: Passphrase for the GPG key used to sign the packages
+  upload_rpm_packages() {
+    local version=$1
+    local bintray_api_key=$2
+    local bintray_gpg_passphrase=$3
+
+    for package in ./pkg/dist/*.rpm; do
+      [ -e "$package" ] || continue
+      local package_name=$(basename "$package")
+      local arch=${package_name#dom4tools_${version}_linux_}
+      arch=${arch%.rpm}
+
+      echo Uploading: $package_name
+      curl \
+        -T ${package} \
+        -upromisedlandt:${bintray_api_key} \
+        --header "X-GPG-PASSPHRASE: ${bintray_gpg_passphrase}" \
+        "https://api.bintray.com/content/promisedlandt/dom4tools_rpm/dom4tools/${version}/${package_name};publish=1"
+    done
+  }
+
+  ####### Main
+
+  main() {
+    # Get the version from the command line
+    local version=$1
+
+    if [ -z $version ]; then
+      echo "Please specify a version"
+      exit 1
+    fi
+
+    # Make sure we have a bintray API key
+    if [ -z $BINTRAY_API_KEY ]; then
+      echo "Please set your bintray API key in the BINTRAY_API_KEY env var"
+      exit 1
+    fi
+
+    # Make sure we have the GPG passphrase to sign Debian packages
+    if [ -z $BINTRAY_GPG_PASSPHRASE ]; then
+      echo "Please set your GPG passphrase in the BINTRAY_GPG_PASSPHRASE env var"
+      exit 1
+    fi
+
+    check_fpm_existence || { fpm_installation_instructions; exit 1; }
+
+    project_root=$(project_root_directory)
+    cd "$project_root" || { echo "Can't cd into $project_root"; exit 1; }
+
+    regenerate_dist_dir
+
+    move_artifacts "$version"
+
+    prepare_packaging_directories "$version"
+
+    build_debian_packages "$version"
+
+    #build_rpm_packages "$version"
+
+    create_checksums "$version"
+
+    upload_binaries "$version" "$BINTRAY_API_KEY" "$BINTRAY_GPG_PASSPHRASE"
+
+    upload_debian_packages "$version" "$BINTRAY_API_KEY" "$BINTRAY_GPG_PASSPHRASE"
+
+    #upload_rpm_packages "$version" "$BINTRAY_API_KEY" "$BINTRAY_GPG_PASSPHRASE"
+
+    exit 0
+  }
+
+  main "$@"
+)

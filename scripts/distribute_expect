@@ -1,0 +1,11 @@
+#!/usr/bin/expect
+
+spawn scripts/distribute [lindex $argv 0]
+
+set pass $env(BINTRAY_GPG_PASSPHRASE)
+set timeout -1
+
+expect {
+  "Enter pass phrase: " { send "$pass\r"; exp_continue }
+  asdf
+}

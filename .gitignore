@@ -1,0 +1,8 @@
+.env
+.tags
+
+tmp/
+pkg/
+bin/
+
+todo.txt

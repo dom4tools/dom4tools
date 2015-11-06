@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+#
+# Build the application from source for multiple platforms
+
+set -e
+(
+  # Checks for the existence of the gox executable
+  check_gox_existence() {
+    hash gox 2>/dev/null
+  }
+
+  gox_installation_instructions() {
+    echo "Could not find gox, install it with"
+    echo "  go get github.com/mitchellh/gox"
+    echo 'and place it in your $PATH'
+  }
+
+  # Find the fullpath to the project root
+  project_root_directory() {
+    local source="${BASH_SOURCE[0]}"
+    # resolve all symlinks
+    while [ -h "$source" ] ; do source="$(readlink "$source")"; done
+    dir="$( cd -P "$( dirname "$source" )/.." && pwd )"
+    echo "$dir"
+  }
+
+  # Are we running in dev mode?
+  dev_mode() {
+    if [ "${D4T_DEV}x" == "x" ]; then
+      return 1
+    else
+      return 0
+    fi
+  }
+
+  usage() {
+    echo "scripts/build"
+    echo "Can set D4T_DEV=1 to build for current arch/os only and skip downloading dependencies"
+  }
+
+  # Download (but not install) all go dependencies for the project
+  get_dependencies() {
+    echo "d4t: Getting dependencies"
+    # -d only downloads without installing
+    go get -d ./...
+  }
+
+  # Delete old build directories so we can start with a clean slate
+  remove_build_directories() {
+    echo "d4t: Removing old directories"
+    rm -f bin/*
+    rm -rf pkg/*
+  }
+
+  # Create all directories we need for the new build
+  create_build_directories() {
+    mkdir -p bin/
+  }
+
+  # Install our fresh build to $GOPATH/bin and bin/
+  move_executable_to_bin() {
+    # Find gopath
+    GOPATH=${GOPATH:-$(go env GOPATH)}
+    case $(uname) in
+      CYGWIN*)
+        GOPATH="$(cygpath $GOPATH)"
+        ;;
+    esac
+    OLDIFS=$IFS
+    IFS=: MAIN_GOPATH=($GOPATH)
+    IFS=$OLDIFS
+
+    # Create GOPATH/bin if it doesn't exist
+    if [ ! -d $MAIN_GOPATH/bin ]; then
+      echo "d4t: Creating GOPATH/bin directory"
+      mkdir -p $MAIN_GOPATH/bin
+    fi
+
+    # Copy our OS/Arch to the bin/ directory
+    DEV_PLATFORM="./pkg/$(go env GOOS)_$(go env GOARCH)"
+    for F in $(find ${DEV_PLATFORM} -mindepth 1 -maxdepth 1 -type f); do
+        cp ${F} bin/
+        cp ${F} ${MAIN_GOPATH}/bin/
+    done
+  }
+
+  ####### Main
+
+  main() {
+    check_gox_existence || { gox_installation_instructions; exit 1; }
+
+    project_root=$(project_root_directory)
+    cd "$project_root" || { echo "Can't cd into $project_root"; exit 1; }
+
+    # Get the git commit
+    GIT_COMMIT=$(git rev-parse HEAD)
+    GIT_DIRTY=$(test -n "`git status --porcelain`" && echo "+CHANGES" || true)
+
+    if dev_mode; then
+      # Only build for arch/os we are currently running on
+      XC_OS=$(go env GOOS)
+      XC_ARCH=$(go env GOARCH)
+    else
+      # Download dependencies, on dev they will already be downloaded and installed
+      get_dependencies
+
+      # Build for these architectures / OSes
+      XC_ARCH=${XC_ARCH:-"386 amd64"}
+      XC_OS=${XC_OS:-linux darwin windows}
+    fi
+
+    remove_build_directories
+    create_build_directories
+
+    # Start the build
+    echo "d4t: Building"
+    gox \
+        -os="${XC_OS}" \
+        -arch="${XC_ARCH}" \
+        -ldflags "-X main.GitCommit ${GIT_COMMIT}${GIT_DIRTY}" \
+        -output "pkg/{{.OS}}_{{.Arch}}/d4t" \
+        ./...
+
+    move_executable_to_bin
+
+    if ! dev_mode; then
+      # Zip and copy to the dist dir
+      echo
+      echo "d4t: Packaging"
+      for PLATFORM in $(find ./pkg -mindepth 1 -maxdepth 1 -type d); do
+        OSARCH=$(basename ${PLATFORM})
+        echo "--> ${OSARCH}"
+
+        pushd $PLATFORM >/dev/null 2>&1
+        zip ../${OSARCH}.zip ./*
+        popd >/dev/null 2>&1
+      done
+    fi
+
+    echo
+    echo "d4t: Results:"
+    ls -hl bin/
+
+    exit 0
+  }
+
+  main "$@"
+)
